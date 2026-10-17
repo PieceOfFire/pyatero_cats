@@ -105,6 +105,7 @@ class Database:
             root / "migrations" / "002_menus_admin.sql",
             root / "migrations" / "003_dialog_order.sql",
             root / "migrations" / "004_telegram_identity.sql",
+            root / "migrations" / "005_mail_drafts.sql",
         ]
         migrations = []
         for version, path in enumerate(files, 1):
@@ -344,7 +345,7 @@ class Database:
             ON CONFLICT (id) DO UPDATE SET description=excluded.description,rarity=excluded.rarity,
                 telegram_file_id=excluded.telegram_file_id,
                 telegram_file_unique_id=excluded.telegram_file_unique_id,
-                source_path=COALESCE(excluded.source_path,cats.source_path),active=true
+                source_path=COALESCE(excluded.source_path,cats.source_path),active=true,is_draft=false
         """,
             cat_id,
             description,
@@ -353,6 +354,54 @@ class Database:
             unique_id,
             source_path,
         )
+
+    async def imported_cat(self, sha256: str):
+        return await self.pool.fetchrow("SELECT * FROM cats WHERE import_sha256=$1", sha256)
+
+    async def add_cat_draft(self, sha256: str, file_id: str, unique_id: str, source_path: str):
+        cat_id = f"mail_{sha256}"
+        row = await self.pool.fetchrow(
+            """INSERT INTO cats(id,description,rarity,telegram_file_id,telegram_file_unique_id,
+                                source_path,active,is_draft,import_sha256)
+               VALUES ($1,'','COM',$2,$3,$4,false,true,$5)
+               ON CONFLICT (import_sha256) DO NOTHING RETURNING *""",
+            cat_id,
+            file_id,
+            unique_id,
+            source_path,
+            sha256,
+        )
+        return row if row is not None else await self.imported_cat(sha256)
+
+    async def cat_drafts(self):
+        return await self.pool.fetch(
+            "SELECT id,description,source_path FROM cats WHERE is_draft ORDER BY created_at,id"
+        )
+
+    @invalidates_profile(user_position=None)
+    async def publish_cat_drafts(self, rows):
+        # Validate all rows before changing anything; publish the batch atomically.
+        validated = [validate_cat(r["id"], r["description"], r["rarity"]) for r in rows]
+        if len({r[0] for r in validated}) != len(validated):
+            raise ValueError("Повторяющиеся ID в таблице черновиков")
+        count = 0
+        async with self.pool.acquire() as conn, conn.transaction():
+            for cat_id, description, rarity in validated:
+                cat = await conn.fetchrow("SELECT * FROM cats WHERE id=$1 FOR UPDATE", cat_id)
+                if cat is None:
+                    raise ValueError(f"Не найден черновик #{cat_id}")
+                if not cat["is_draft"]:
+                    if cat["description"] == description and cat["rarity"] == rarity:
+                        continue  # Retrying the same CSV must not edit or reactivate a published card.
+                    raise ValueError(f"Карточка #{cat_id} уже опубликована; используй обычное редактирование")
+                await conn.execute(
+                    "UPDATE cats SET description=$2,rarity=$3,is_draft=false,active=true WHERE id=$1",
+                    cat_id,
+                    description,
+                    rarity,
+                )
+                count += 1
+        return count
 
     async def claim_update(self, update_id: int) -> str:
         # A lease is longer than the HTTP processing deadline (45 s). Crashes leave no ACK,
@@ -493,7 +542,9 @@ class Database:
 
     @invalidates_profile(user_position=None)
     async def set_cat_active(self, cat_id: str, active: bool):
-        return await self.pool.fetchval("UPDATE cats SET active=$2 WHERE id=$1 RETURNING id", cat_id, active)
+        return await self.pool.fetchval(
+            "UPDATE cats SET active=$2 WHERE id=$1 AND (NOT $2 OR NOT is_draft) RETURNING id", cat_id, active
+        )
 
     async def stats(self):
         return await self.pool.fetchrow("""

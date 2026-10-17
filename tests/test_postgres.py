@@ -218,3 +218,50 @@ async def test_identity_migration_preserves_legacy_nicknames(db):
             ("@legacy", True, 5),
         ]
         assert all(r["telegram_username"] is None for r in rows)
+
+
+async def test_mail_drafts_are_hidden_until_reviewed_and_cannot_be_enabled_by_hide_show(db):
+    card = await db.add_cat_draft("a" * 64, "file", "unique", "/archive/cat.jpg")
+    assert card["is_draft"] and not card["active"]
+    assert (await db.profile(10, 3))["total"] == 0
+    assert await db.roll(1, 10, 3) == {"error": "empty"}
+    assert await db.set_cat_active(card["id"], True) is None
+    ready = [{"id": card["id"], "description": "Кот", "rarity": "EPIC"}]
+    assert await db.publish_cat_drafts(ready) == 1
+    result = await db.roll(2, 10, 3)
+    assert result["points"] == 20
+    assert (await db.profile(10, 3))["total"] == 1
+    assert await db.publish_cat_drafts(ready) == 0
+
+
+async def test_parallel_imports_keep_one_draft_and_keep_published_metadata(db):
+    cards = await asyncio.gather(*(db.add_cat_draft("a" * 64, f"file{i}", "u", "/cat.jpg") for i in range(8)))
+    assert len({r["id"] for r in cards}) == 1
+    assert len(await db.cat_drafts()) == 1
+    await db.publish_cat_drafts([{"id": cards[0]["id"], "description": "Кот", "rarity": "LEG"}])
+    repeated = await db.add_cat_draft("a" * 64, "new_file", "u", "/other.jpg")
+    assert repeated["description"] == "Кот" and repeated["rarity"] == "LEG" and not repeated["is_draft"]
+
+
+async def test_invalid_draft_publication_does_not_publish_any_rows(db):
+    card = await db.add_cat_draft("b" * 64, "file", "u", "/cat.jpg")
+    with pytest.raises(ValueError):
+        await db.publish_cat_drafts(
+            [
+                {"id": card["id"], "description": "Кот", "rarity": "RARE"},
+                {"id": "missing", "description": "Кот", "rarity": "COM"},
+            ]
+        )
+    assert len(await db.cat_drafts()) == 1
+    assert not await db.pool.fetchval("SELECT active FROM cats WHERE id=$1", card["id"])
+    with pytest.raises(ValueError):
+        await db.publish_cat_drafts([{"id": card["id"], "description": "Кот", "rarity": "WRONG"}])
+
+
+async def test_retry_publication_does_not_reenable_a_hidden_card(db):
+    card = await db.add_cat_draft("c" * 64, "file", "u", "/cat.jpg")
+    ready = [{"id": card["id"], "description": "Кот", "rarity": "COM"}]
+    await db.publish_cat_drafts(ready)
+    await db.set_cat_active(card["id"], False)
+    assert await db.publish_cat_drafts(ready) == 0
+    assert not await db.pool.fetchval("SELECT active FROM cats WHERE id=$1", card["id"])

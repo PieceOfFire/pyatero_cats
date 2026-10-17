@@ -3,8 +3,6 @@
 import argparse
 import asyncio
 import contextlib
-import csv
-import io
 import os
 import re
 from datetime import UTC, date, datetime
@@ -16,22 +14,11 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import BufferedInputFile
 from dotenv import load_dotenv
 
+from catbot.catalog import export_drafts, import_mail, publish_drafts, read_csv
 from catbot.config import Settings
 from catbot.db import Database
 from catbot.domain import POINTS, validate_cat
 from catbot.mail_storage import MAX_PHOTO_BYTES, MailStorage
-
-
-async def read_csv(path: Path):
-    text = await asyncio.to_thread(path.read_text, encoding="utf-8-sig")
-    try:
-        dialect = csv.Sniffer().sniff(text[:8192], delimiters=",;\t")
-    except csv.Error:
-        dialect = csv.excel
-    return [
-        {str(k).strip().lower(): (v or "").strip() for k, v in row.items() if k is not None}
-        for row in csv.DictReader(io.StringIO(text), dialect=dialect)
-    ]
 
 
 async def import_catalog(path: Path, db: Database, bot: Bot, settings: Settings):
@@ -222,6 +209,24 @@ async def run(args):
             await import_catalog(Path(args.csv), db, bot, settings)
         elif args.command == "import-users":
             await import_users(Path(args.csv), db, settings)
+        elif args.command == "import-mail":
+            inbox = args.inbox or os.getenv("MAIL_IMPORT_INBOX", "/pyatero-cats/inbox")
+            archive = args.archive or os.getenv("MAIL_IMPORT_ARCHIVE", "/pyatero-cats/imported")
+            async with MailStorage(os.getenv("MAIL_USER", ""), os.getenv("MAIL_APP_PASSWORD", "")) as mail:
+                result = await import_mail(mail, db, bot, settings, inbox, archive, args.csv, args.limit)
+            print(
+                f"Новых: {result['imported']}; повторных: {result['reused']}; "
+                f"перенесено: {result['moved']}; пропущено не-фото: {result['ignored']}; "
+                f"черновиков: {result['drafts']}; ошибок: {result['errors']}. CSV: {args.csv}"
+            )
+            if result["errors"]:
+                raise RuntimeError("Часть файлов не обработана; исправь ошибки и повтори импорт")
+        elif args.command == "export-drafts":
+            count = await export_drafts(args.csv, db)
+            print(f"Черновиков: {count}. Таблица: {args.csv}")
+        elif args.command == "publish-drafts":
+            count, pending = await publish_drafts(args.csv, db)
+            print(f"Опубликовано: {count}; строк без подписи или редкости: {pending}")
         elif args.command == "prune":
             print(await db.prune_receipts())
     finally:
@@ -236,6 +241,14 @@ def main():
     for name in ("import-cats", "import-users"):
         sub = subs.add_parser(name)
         sub.add_argument("csv")
+    sub = subs.add_parser("import-mail", help="Фото из папки Mail → черновики в базе + CSV для подписей")
+    sub.add_argument("--inbox", help="Папка Mail с новыми фото; по умолчанию MAIL_IMPORT_INBOX")
+    sub.add_argument("--archive", help="Куда переносить фото; по умолчанию MAIL_IMPORT_ARCHIVE")
+    sub.add_argument("--csv", default="data/private/mail-drafts.csv")
+    sub.add_argument("--limit", type=int, default=100)
+    for name in ("export-drafts", "publish-drafts"):
+        sub = subs.add_parser(name)
+        sub.add_argument("csv", nargs="?", default="data/private/mail-drafts.csv")
     sub = subs.add_parser("backup", help="pg_dump; опционально загрузить результат в Mail")
     sub.add_argument("--output", default="backups")
     sub.add_argument("--mail", action="store_true")

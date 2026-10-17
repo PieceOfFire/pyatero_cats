@@ -1,0 +1,26 @@
+# Put the CONTENTS of this folder at the root of a separate GitHub repository.
+services:
+  - type: web
+    name: pyatero-cats
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.lock.txt
+    startCommand: python -m catbot
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: MODE
+        value: webhook
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: ADMIN_ID
+        sync: false
+      - key: MEDIA_CHAT_ID
+        sync: false
+      - key: DAILY_REWARD_MODE
+        value: streak

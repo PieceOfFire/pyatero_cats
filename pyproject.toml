@@ -1,0 +1,18 @@
+[project]
+name = "pyatero-cats"
+version = "0.1.0"
+description = "Асинхронный коллекционный Telegram-бот Пятеро котят"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["postgres: requires TEST_DATABASE_URL pointing to an empty PostgreSQL database"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

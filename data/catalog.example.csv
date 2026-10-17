@@ -1,0 +1,3 @@
+id,description,rarity,telegram_file_id,local_path,mail_path
+cat001,Первый котёнок,COM,,images/cat001.jpg,
+cat002,Котёнок из Облака Mail,RARE,,,/Котята/cat002.jpg

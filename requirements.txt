@@ -1,0 +1,5 @@
+aiogram>=3.13,<4
+aiohttp>=3.9,<4
+asyncpg>=0.29,<1
+python-dotenv>=1.0,<2
+tzdata>=2024.1; sys_platform == "win32"

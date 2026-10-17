@@ -29,6 +29,28 @@ class Processor:
         self.navigation_done = TTLCache(ttl=300, capacity=4096)
         self.navigation_running = set()
         self.navigation_pending = {}
+        self.identities = TTLCache(ttl=300)
+
+    async def sync_identity(self, update: Update):
+        query, message = update.callback_query, update.message
+        actor = query.from_user if query else (message.from_user if message else None)
+        chat = query.message.chat if query and query.message else (message.chat if message else None)
+        if not actor or actor.is_bot or not chat or chat.type != "private":
+            return
+        cached = self.identities.get(actor.id)
+        if cached is not None:
+            version, username = cached
+            if version > update.update_id:
+                return
+            if username == actor.username:
+                self.identities.put(actor.id, (update.update_id, username))
+                return
+        applied = await self.db.sync_telegram_user(
+            actor.id, actor.username, self.settings.initial_spins, update.update_id
+        )
+        latest = self.identities.get(actor.id)
+        if applied and (latest is None or latest[0] <= update.update_id):
+            self.identities.put(actor.id, (update.update_id, actor.username))
 
     async def process(self, update: Update):
         try:
@@ -55,6 +77,7 @@ class Processor:
                     pending = asyncio.Event()
                     self.navigation_pending.setdefault(user_id, set()).add(pending)
                     try:
+                        await self.sync_identity(update)
                         await self.dispatcher.feed_update(
                             self.bot, update, db=self.db, settings=self.settings
                         )
@@ -74,6 +97,7 @@ class Processor:
                 if state == "busy":
                     raise BusyUpdate
                 claimed = True
+                await self.sync_identity(update)
                 await self.dispatcher.feed_update(self.bot, update, db=self.db, settings=self.settings)
                 await self.db.finish_update(update.update_id)
         except BaseException:

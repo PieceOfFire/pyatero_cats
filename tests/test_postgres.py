@@ -3,6 +3,7 @@
 import asyncio
 import os
 from datetime import date
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -162,3 +163,62 @@ async def test_profile_cache_does_not_control_balance_and_invalidates_on_change(
     assert (await db.profile(123, 3))["spins"] == 0
     await db.set_nickname(123, "Новое имя", 3)
     assert (await db.profile(123, 3))["nickname"] == "Новое имя"
+
+
+async def test_new_user_defaults_to_username_and_manual_nickname_is_independent(db):
+    assert await db.sync_telegram_user(10, "cat_owner", 3, 1)
+    user = await db.profile(10, 3)
+    assert (user["nickname"], user["telegram_username"], user["spins"]) == ("@cat_owner", "cat_owner", 3)
+    await db.set_nickname(10, "Мурзик", 3)
+    await db.sync_telegram_user(10, "new_owner", 3, 2)
+    user = await db.profile(10, 3)
+    assert (user["nickname"], user["telegram_username"]) == ("Мурзик", "new_owner")
+    await db.sync_telegram_user(10, None, 3, 3)
+    user = await db.profile(10, 3)
+    assert user["telegram_username"] is None
+    assert user["last_known_telegram_username"] == "new_owner"
+    assert user["nickname"] == "Мурзик"
+
+
+async def test_username_appears_later_and_can_be_restored_as_auto_nickname(db):
+    await db.sync_telegram_user(10, None, 3, 1)
+    assert (await db.profile(10, 3))["nickname"] == ""
+    await db.sync_telegram_user(10, "cat_owner", 3, 2)
+    assert (await db.profile(10, 3))["nickname"] == "@cat_owner"
+    await db.set_nickname(10, "Мурзик", 3)
+    await db.set_nickname(10, "@cat_owner", 3, custom=False)
+    await db.sync_telegram_user(10, "new_owner", 3, 3)
+    assert (await db.profile(10, 3))["nickname"] == "@new_owner"
+    await db.sync_telegram_user(10, None, 3, 4)
+    assert (await db.profile(10, 3))["nickname"] == ""
+
+
+async def test_parallel_out_of_order_identity_updates_preserve_rewards_and_collection(db):
+    await seed(db)
+    await db.roll(1, 10, 3)
+    await asyncio.gather(*(db.sync_telegram_user(10, f"owner_{n}", 3, n) for n in range(2, 12)))
+    assert not await db.sync_telegram_user(10, "stale_owner", 3, 1)
+    user = await db.profile(10, 3)
+    assert (user["nickname"], user["spins"], user["score"], user["owned"]) == ("@owner_11", 2, 1, 1)
+    await db.pool.execute("UPDATE users SET telegram_identity_seen_at=now()-interval '8 days'")
+    assert await db.sync_telegram_user(10, "reset_sequence", 3, 1)
+
+
+async def test_identity_migration_preserves_legacy_nicknames(db):
+    migration = await asyncio.to_thread(
+        Path("catbot/migrations/004_telegram_identity.sql").read_text, encoding="utf-8"
+    )
+    async with db.pool.acquire() as conn, conn.transaction():
+        # Shadow the real table in this connection: rehearse an upgrade from v3.
+        await conn.execute("""CREATE TEMP TABLE users(
+            telegram_id bigint PRIMARY KEY, nickname text NOT NULL DEFAULT '', spins integer
+        ) ON COMMIT DROP""")
+        await conn.execute("INSERT INTO users VALUES (1,'Мурзик',7),(2,'',3),(3,'@legacy',5)")
+        await conn.execute(migration)
+        rows = await conn.fetch("SELECT * FROM users ORDER BY telegram_id")
+        assert [(r["nickname"], r["nickname_custom"], r["spins"]) for r in rows] == [
+            ("Мурзик", True, 7),
+            ("", False, 3),
+            ("@legacy", True, 5),
+        ]
+        assert all(r["telegram_username"] is None for r in rows)

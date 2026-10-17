@@ -52,6 +52,7 @@ def admin_panel():
             [button("🎟 Создать промокод", "admin_promo_create")],
             [button("📋 Промокоды", "admin_promos"), button("⛔ Отключить код", "admin_promo_disable")],
             [button("📊 Статистика", "admin_stats")],
+            [button("👥 Пользователи", "admin_users:0")],
             [button("🏠 Главное меню", "back_main")],
             [button("🔓 Выйти из админского режима", "admin_exit")],
         ]

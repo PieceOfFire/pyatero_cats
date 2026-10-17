@@ -79,10 +79,12 @@ def create_router() -> Router:
 
     async def profile(message, user_id, db, settings, edit=False):
         record = await db.profile(user_id, settings.initial_spins)
+        username = record.get("telegram_username")
         await render(
             message,
             (
                 f"⭐ Профиль · {record['nickname'] or 'Котолюб'}\n\n"
+                f"Telegram: {'@' + username if username else 'username не задан'}\nID: {user_id}\n\n"
                 f"💰 Спинов: {record['spins']}\n⭐ Очков: {record['score']}\n"
                 f"📚 В коллекции: {record['owned']} · Активных карточек: {record['total']}\n"
                 f"🔥 Стрик: {record['streak']}"
@@ -126,7 +128,10 @@ def create_router() -> Router:
         if not 1 <= len(nick) <= 60 or ("@" in nick and not username):
             await render(message, "Ник: 1–60 символов, без @. Попробуй ещё раз.", kb.back(), edit)
             return
-        await db.set_nickname(user_id, nick, settings.initial_spins)
+        if username:
+            await db.set_nickname(user_id, nick, settings.initial_spins, custom=False)
+        else:
+            await db.set_nickname(user_id, nick, settings.initial_spins)
         await db.clear_dialog(user_id, "nick")
         await main_menu(message, user_id, db, settings, edit, f"✨ Ник изменён: {nick}")
 
@@ -481,6 +486,34 @@ def create_router() -> Router:
                 f"Активных карточек: {stat['cats']}\nВыдач: {stat['rolls']}\n"
                 f"Активаций промокодов: {stat['redemptions']}",
                 kb.back("admin_open"),
+                True,
+            )
+        elif data.startswith("admin_users:"):
+            page = data.partition(":")[2]
+            if not page.isascii() or not page.isdigit() or len(page) > 8:
+                return
+            offset = int(page)
+            rows, count = await db.admin_users(offset)
+            lines = []
+            for user in rows:
+                username = user["telegram_username"]
+                previous = user["last_known_telegram_username"]
+                handle = f"@{username}" if username else "username не задан / ещё не получен"
+                if not username and previous:
+                    handle += f" (последний известный: @{previous})"
+                lines.append(
+                    f"{user['nickname'][:60] or 'Без ника'}\nTelegram: {handle}\nID: {user['telegram_id']}"
+                )
+            arrows = []
+            if offset:
+                arrows.append(kb.button("←", f"admin_users:{max(0, offset - 10)}"))
+            if offset + 10 < count:
+                arrows.append(kb.button("→", f"admin_users:{offset + 10}"))
+            buttons = ([arrows] if arrows else []) + [[kb.button("⬅️ Назад", "admin_open")]]
+            await render(
+                msg,
+                f"👥 Пользователи: {count}\n\n" + ("\n\n".join(lines) or "Пока пусто"),
+                InlineKeyboardMarkup(inline_keyboard=buttons),
                 True,
             )
         else:

@@ -6,18 +6,18 @@ from aiogram.types import Update
 
 from catbot.app import Processor
 from catbot.config import Settings
-from catbot.db import Database
+from catbot.db import Database, direct_database_url
 from catbot.runtime import NAVIGATION, TTLCache, current_update_id, is_navigation
 
 
-def navigation(data, update_id=1):
+def navigation(data, update_id=1, username=None):
     return Update.model_validate(
         {
             "update_id": update_id,
             "callback_query": {
                 "id": str(update_id),
                 "chat_instance": "test",
-                "from": {"id": 123, "is_bot": False, "first_name": "Tester"},
+                "from": {"id": 123, "is_bot": False, "first_name": "Tester", "username": username},
                 "data": data,
                 "message": {"message_id": 1, "date": 0, "chat": {"id": 123, "type": "private"}},
             },
@@ -141,3 +141,61 @@ async def test_profile_is_one_read_then_cache_and_does_not_lock_user():
     conn.fetchrow.assert_awaited_once()
     conn.execute.assert_not_awaited()
     assert "FOR UPDATE" not in conn.fetchrow.await_args.args[0]
+
+
+def test_direct_migration_url_changes_only_neon_pooler_host():
+    url = "postgresql://user:secret%40example@ep-test-pooler.eu.aws.neon.tech/cats?sslmode=require"
+    assert direct_database_url(url) == url.replace("ep-test-pooler.", "ep-test.")
+    assert direct_database_url("postgresql://u:p@localhost/cats") == "postgresql://u:p@localhost/cats"
+
+
+async def test_identity_uses_callback_actor_and_caches_unchanged_username():
+    db, dispatcher = AsyncMock(), AsyncMock()
+    db.sync_telegram_user.return_value = True
+    processor = Processor(AsyncMock(), dispatcher, db, Settings("token", "postgresql://db/cats"))
+    first = navigation("change_nick", 10, "cat_owner")
+    await processor.process(first)
+    second = navigation("nick_manual", 11, "cat_owner")
+    await processor.process(second)
+    db.sync_telegram_user.assert_awaited_once_with(123, "cat_owner", 3, 10)
+    changed = navigation("profile", 12, "new_owner")
+    await processor.process(changed)
+    assert db.sync_telegram_user.await_args.args == (123, "new_owner", 3, 12)
+    await processor.process(first.model_copy(update={"update_id": 9}))
+    assert db.sync_telegram_user.await_count == 2
+
+
+async def test_start_synchronizes_username_before_rendering_profile():
+    db, dispatcher = AsyncMock(), AsyncMock()
+    db.claim_update.return_value = "claimed"
+    db.sync_telegram_user.return_value = True
+    processor = Processor(AsyncMock(), dispatcher, db, Settings("token", "postgresql://db/cats"))
+    update = Update.model_validate(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 0,
+                "chat": {"id": 123, "type": "private"},
+                "from": {"id": 123, "is_bot": False, "first_name": "Cat", "username": "cat_owner"},
+                "text": "/start",
+            },
+        }
+    )
+
+    async def feed(*args, **kwargs):
+        db.sync_telegram_user.assert_awaited_once_with(123, "cat_owner", 3, 1)
+
+    dispatcher.feed_update.side_effect = feed
+    await processor.process(update)
+
+
+async def test_failed_identity_sync_is_retryable():
+    db, dispatcher = AsyncMock(), AsyncMock()
+    db.sync_telegram_user.side_effect = [RuntimeError("unavailable"), True]
+    processor = Processor(AsyncMock(), dispatcher, db, Settings("token", "postgresql://db/cats"))
+    with pytest.raises(RuntimeError):
+        await processor.process(navigation("profile"))
+    dispatcher.feed_update.assert_not_awaited()
+    await processor.process(navigation("profile"))
+    assert db.sync_telegram_user.await_count == 2

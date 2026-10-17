@@ -180,7 +180,40 @@ async def test_manual_nickname_survives_separate_dispatcher_instance():
 async def test_username_uses_player_id_instead_of_bot_message_author():
     db = fake_db()
     await dispatch(callback("nick_use_username", "cat_owner"), db)
-    db.set_nickname.assert_awaited_once_with(123, "@cat_owner", 3)
+    db.set_nickname.assert_awaited_once_with(123, "@cat_owner", 3, custom=False)
+
+
+async def test_profile_shows_telegram_identity_separately_from_nickname():
+    db = fake_db()
+    db.profile.return_value["telegram_username"] = "cat_owner"
+    requests = await dispatch(message(text="/profile"), db)
+    text = next(r.text for r in requests if isinstance(r, SendMessage))
+    assert "Тестовый кот" in text and "@cat_owner" in text and "ID: 123" in text
+
+
+async def test_admin_directory_requires_allowlist_and_active_session():
+    db = fake_db()
+    await dispatch(callback("admin_users:0"), db)
+    db.admin_users.assert_not_awaited()
+    settings = Settings("token", "postgresql://db/cats", admin_ids=frozenset({123}))
+    await dispatch(callback("admin_users:0"), db, settings)
+    db.admin_users.assert_not_awaited()
+    db.admin_active.return_value = True
+    db.admin_users.return_value = (
+        [
+            {
+                "telegram_id": 321,
+                "nickname": "Мурзик",
+                "telegram_username": None,
+                "last_known_telegram_username": "old_owner",
+            }
+        ],
+        11,
+    )
+    requests = await dispatch(callback("admin_users:0"), db, settings)
+    text = next(r.text for r in requests if isinstance(r, EditMessageText))
+    assert "Мурзик" in text and "последний известный: @old_owner" in text and "ID: 321" in text
+    db.admin_users.assert_awaited_once_with(0)
 
 
 async def test_ordinary_user_cannot_enter_admin_mode():

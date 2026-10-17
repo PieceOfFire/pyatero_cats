@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from contextlib import asynccontextmanager
 from datetime import date
 from functools import wraps
 from pathlib import Path
@@ -49,9 +50,18 @@ def asyncpg_url(url: str) -> str:
     return urlunsplit(parsed._replace(query=urlencode(query)))
 
 
+def direct_database_url(url: str) -> str:
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    if host.endswith(".neon.tech") and "-pooler." in host:
+        parsed = parsed._replace(netloc=parsed.netloc.replace(host, host.replace("-pooler.", ".", 1)))
+    return asyncpg_url(urlunsplit(parsed))
+
+
 class Database:
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(self, pool: asyncpg.Pool, migration_url: str | None = None):
         self.pool = pool
+        self._migration_url = migration_url
         self._profiles = TTLCache(ttl=15)
         self._profile_generation = 0
 
@@ -68,7 +78,7 @@ class Database:
             max_inactive_connection_lifetime=60,
             timeout=15,
         )
-        return cls(pool)
+        return cls(pool, direct_database_url(url))
 
     async def close(self):
         try:
@@ -76,18 +86,31 @@ class Database:
         except TimeoutError:
             self.pool.terminate()
 
+    @asynccontextmanager
+    async def _migration_connection(self):
+        if self._migration_url:
+            conn = await asyncpg.connect(self._migration_url, timeout=20, command_timeout=60)
+            try:
+                yield conn
+            finally:
+                await conn.close()
+        else:
+            async with self.pool.acquire() as conn:
+                yield conn
+
     async def migrate(self):
         root = Path(__file__).parent
         files = [
             root / "schema.sql",
             root / "migrations" / "002_menus_admin.sql",
             root / "migrations" / "003_dialog_order.sql",
+            root / "migrations" / "004_telegram_identity.sql",
         ]
         migrations = []
         for version, path in enumerate(files, 1):
             sql = await asyncio.to_thread(path.read_text, encoding="utf-8")
             migrations.append((version, sql, hashlib.sha256(sql.encode()).hexdigest()))
-        async with self.pool.acquire() as conn, conn.transaction():
+        async with self._migration_connection() as conn, conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock(827361001)")
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS schema_versions (
@@ -129,6 +152,49 @@ class Database:
             initial_spins,
         )
         return await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1 FOR UPDATE", user_id)
+
+    @invalidates_profile()
+    async def sync_telegram_user(
+        self, user_id: int, username: str | None, initial_spins: int, update_id: int
+    ):
+        """Register the real actor; retain manual names, balances and stable Telegram ID."""
+        async with self.pool.acquire() as conn:
+            applied = await conn.fetchval(
+                """
+                INSERT INTO users(
+                    telegram_id,spins,nickname,telegram_username,last_known_telegram_username,
+                    telegram_identity_update_id,telegram_identity_seen_at
+                ) VALUES ($1,$2,CASE WHEN $3::text IS NULL THEN '' ELSE '@'||$3 END,$3,$3,$4,now())
+                ON CONFLICT (telegram_id) DO UPDATE SET
+                    telegram_username=EXCLUDED.telegram_username,
+                    last_known_telegram_username=COALESCE(
+                        EXCLUDED.telegram_username,users.last_known_telegram_username
+                    ),
+                    nickname=CASE WHEN users.nickname_custom THEN users.nickname
+                        ELSE EXCLUDED.nickname END,
+                    telegram_identity_update_id=EXCLUDED.telegram_identity_update_id,
+                    telegram_identity_seen_at=now()
+                WHERE users.telegram_identity_update_id<=EXCLUDED.telegram_identity_update_id
+                    OR users.telegram_identity_seen_at IS NULL
+                    OR users.telegram_identity_seen_at<now()-interval '1 day'
+                RETURNING telegram_id
+                """,
+                user_id,
+                initial_spins,
+                username or None,
+                update_id,
+            )
+        return applied is not None
+
+    async def admin_users(self, offset=0):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT telegram_id,nickname,telegram_username,last_known_telegram_username
+                   FROM users ORDER BY created_at,telegram_id LIMIT 10 OFFSET $1""",
+                offset,
+            )
+            count = await conn.fetchval("SELECT count(*) FROM users")
+        return rows, count
 
     async def profile(self, user_id: int, initial_spins: int):
         cached = self._profiles.get(user_id)
@@ -251,10 +317,15 @@ class Database:
         )
 
     @invalidates_profile()
-    async def set_nickname(self, user_id: int, nickname: str, initial_spins: int):
+    async def set_nickname(self, user_id: int, nickname: str, initial_spins: int, *, custom=True):
         async with self.pool.acquire() as conn, conn.transaction():
             await self._user(conn, user_id, initial_spins)
-            await conn.execute("UPDATE users SET nickname=$2 WHERE telegram_id=$1", user_id, nickname)
+            await conn.execute(
+                "UPDATE users SET nickname=$2,nickname_custom=$3 WHERE telegram_id=$1",
+                user_id,
+                nickname,
+                custom,
+            )
 
     async def top(self):
         return await self.pool.fetch("""

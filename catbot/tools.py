@@ -125,8 +125,8 @@ async def import_users(path: Path, db: Database, settings: Settings):
         for user_id, nick, spins, score, last_daily, owned, streak in parsed:
             inserted = await conn.fetchval(
                 """
-                INSERT INTO users(telegram_id,nickname,spins,score,last_daily,streak)
-                VALUES ($1,$2,$3,$4,$5,$6)
+                INSERT INTO users(telegram_id,nickname,spins,score,last_daily,streak,nickname_custom)
+                VALUES ($1,$2,$3,$4,$5,$6,$2<>'')
                 ON CONFLICT DO NOTHING RETURNING telegram_id
             """,
                 user_id,

@@ -1,9 +1,12 @@
+import asyncio
+import logging
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, Update
 
@@ -11,19 +14,24 @@ from catbot import keyboards as kb
 from catbot.config import Settings
 from catbot.db import Database
 from catbot.domain import LABELS, parse_promo, promo_code, validate_cat
+from catbot.runtime import current_update_id, is_navigation
 
 menu = kb.menu
+logger = logging.getLogger(__name__)
 
 
 async def render(message: Message, text: str, markup=None, edit=False):
+    started = time.perf_counter()
     if edit and message.text is not None:
         try:
             await message.edit_text(text, reply_markup=markup)
+            logger.info("Menu rendered elapsed_ms=%d", (time.perf_counter() - started) * 1000)
             return
         except TelegramBadRequest as error:
             if "message is not modified" in str(error).lower():
                 return
     await message.answer(text, reply_markup=markup)
+    logger.info("Menu rendered elapsed_ms=%d", (time.perf_counter() - started) * 1000)
 
 
 async def send_card(bot: Bot, chat_id: int, card, settings: Settings):
@@ -47,9 +55,6 @@ def create_router() -> Router:
     router.message.filter(F.chat.type == ChatType.PRIVATE)
     router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
 
-    async def active_admin(user_id, db, settings):
-        return settings.is_admin(user_id) and await db.admin_active(user_id)
-
     async def require_admin(message, user_id, db, settings):
         if not settings.is_admin(user_id):
             await message.answer("⛔ Эта функция доступна только администратору.")
@@ -68,8 +73,9 @@ def create_router() -> Router:
         )
         if note:
             text += f"\n\n{note}"
-        admin = await active_admin(user_id, db, settings)
-        await render(message, text, menu(settings, user_id, admin), edit)
+        # The entry button depends only on the allowlist. Privileged actions still
+        # check the durable admin session; drawing a menu needs no session query.
+        await render(message, text, menu(settings, user_id), edit)
 
     async def profile(message, user_id, db, settings, edit=False):
         record = await db.profile(user_id, settings.initial_spins)
@@ -355,11 +361,60 @@ def create_router() -> Router:
             note = f"🎉 Спасибо за подписку! +{result['added']} спинов."
         await main_menu(query.message, query.from_user.id, db, settings, True, note)
 
+    async def answer_navigation(query):
+        try:
+            await query.answer()
+        except TelegramAPIError:
+            # A failed/expired cosmetic callback answer must not block the menu.
+            pass
+
+    async def navigation_view(query, db, settings):
+        data, user_id, msg = query.data, query.from_user.id, query.message
+        if data == "back_main":
+            await main_menu(msg, user_id, db, settings, True)
+        elif data == "rewards":
+            await render(msg, "🎁 Меню наград\n\nВыбери:", kb.rewards(settings), True)
+        elif data == "change_nick":
+            await render(msg, "✏️ Как установить ник?", kb.nickname(), True)
+        elif data == "nick_manual":
+            await render(msg, "✏️ Введи новый ник одним сообщением, без @:", kb.back(), True)
+        elif data == "promo_enter":
+            await render(msg, "✏️ Введи промокод одним сообщением:", kb.back("rewards"), True)
+        elif data == "reward_sub":
+            await render(
+                msg, "📢 Подпишись на канал и забери награду один раз.", kb.subscription(settings), True
+            )
+        elif data == "profile":
+            await profile(msg, user_id, db, settings, True)
+        elif data in {"top", "leaderboard"}:
+            await top(msg, db, True)
+        else:
+            await collection(msg, user_id, int(data.partition(":")[2]), db, True)
+
+    async def navigate(query, event_update, db, settings):
+        # Persist dialog transitions concurrently with the visible response. The
+        # SQL update_id guard prevents an older clear from erasing a newer prompt.
+        context = current_update_id.set(event_update.update_id)
+        try:
+            async with asyncio.TaskGroup() as group:
+                group.create_task(navigation_view(query, db, settings))
+                group.create_task(answer_navigation(query))
+                state = {"nick_manual": "nick", "promo_enter": "promo"}.get(query.data)
+                if state:
+                    group.create_task(db.set_dialog(query.from_user.id, state))
+                else:
+                    group.create_task(db.clear_dialog(query.from_user.id))
+        finally:
+            current_update_id.reset(context)
+
     @router.callback_query()
     async def callback(
         query: CallbackQuery, event_update: Update, bot: Bot, db: Database, settings: Settings
     ):
         data, user_id, msg = query.data or "", query.from_user.id, query.message
+        if is_navigation(event_update):
+            await navigate(query, event_update, db, settings)
+            return
         # Verify privileges on every sensitive callback, even if the button was forged.
         if data.startswith("admin_") and data not in {"admin_open", "admin_exit"}:
             if not await require_admin(msg, user_id, db, settings):
@@ -374,41 +429,17 @@ def create_router() -> Router:
             pass
         # Navigating with any old menu cancels pending input before a new prompt is set.
         await db.clear_dialog(user_id)
-        if data == "back_main":
-            await main_menu(msg, user_id, db, settings, True)
-        elif data == "spin":
+        if data == "spin":
             await spin(msg, user_id, event_update.update_id, bot, db, settings)
         elif data in {"daily", "reward_daily"}:
             await daily(msg, user_id, db, settings, True)
-        elif data == "rewards":
-            await render(msg, "🎁 Меню наград\n\nВыбери:", kb.rewards(settings), True)
-        elif data == "profile":
-            await profile(msg, user_id, db, settings, True)
-        elif data in {"leaderboard", "top"}:
-            await top(msg, db, True)
-        elif data == "change_nick":
-            await render(msg, "✏️ Как установить ник?", kb.nickname(), True)
-        elif data == "nick_manual":
-            await db.set_dialog(user_id, "nick")
-            await render(msg, "✏️ Введи новый ник одним сообщением, без @:", kb.back(), True)
         elif data == "nick_use_username":
             if query.from_user.username:
                 await save_nick(msg, user_id, f"@{query.from_user.username}", db, settings, True, True)
             else:
                 await render(msg, "У тебя нет @username. Введи ник вручную.", kb.nickname(), True)
-        elif data == "promo_enter":
-            await db.set_dialog(user_id, "promo")
-            await render(msg, "✏️ Введи промокод одним сообщением:", kb.back("rewards"), True)
-        elif data == "reward_sub":
-            await render(
-                msg, "📢 Подпишись на канал и забери награду один раз.", kb.subscription(settings), True
-            )
         elif data == "subscription_check":
             await check_subscription(query, bot, db, settings)
-        elif data.startswith("collection:"):
-            offset = data.partition(":")[2]
-            if offset.isdigit() and len(offset) <= 8:
-                await collection(msg, user_id, int(offset), db, True)
         elif data == "admin_open":
             await enter_admin(msg, user_id, db, settings, True)
         elif data == "admin_exit":

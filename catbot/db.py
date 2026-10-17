@@ -1,12 +1,44 @@
 import asyncio
 import hashlib
 from datetime import date
+from functools import wraps
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import asyncpg
 
 from catbot.domain import POINTS, choose_cat, daily_terms, validate_cat
+from catbot.runtime import TTLCache, current_update_id
+
+
+def invalidates_profile(user_position=0):
+    """Display caches never participate in balance checks or reward decisions."""
+
+    def decorate(function):
+        @wraps(function)
+        async def wrapped(self, *args, **kwargs):
+            user_id = (
+                None
+                if user_position is None
+                else (kwargs["user_id"] if "user_id" in kwargs else args[user_position])
+            )
+
+            def invalidate():
+                self._profile_generation += 1
+                if user_id is None:
+                    self._profiles.clear()
+                else:
+                    self._profiles.discard(user_id)
+
+            invalidate()
+            try:
+                return await function(self, *args, **kwargs)
+            finally:
+                invalidate()
+
+        return wrapped
+
+    return decorate
 
 
 def asyncpg_url(url: str) -> str:
@@ -20,16 +52,19 @@ def asyncpg_url(url: str) -> str:
 class Database:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
+        self._profiles = TTLCache(ttl=15)
+        self._profile_generation = 0
 
     @classmethod
     async def connect(cls, url: str, max_size: int = 5) -> "Database":
-        # Neon pooled URLs work without session state or prepared statement caching.
+        # Neon PgBouncer supports protocol-level prepared statements. Caching avoids
+        # repeated parse/describe network round trips for every query.
         pool = await asyncpg.create_pool(
             dsn=asyncpg_url(url),
             min_size=0,
             max_size=max_size,
             command_timeout=12,
-            statement_cache_size=0,
+            statement_cache_size=100,
             max_inactive_connection_lifetime=60,
             timeout=15,
         )
@@ -43,7 +78,11 @@ class Database:
 
     async def migrate(self):
         root = Path(__file__).parent
-        files = [root / "schema.sql", root / "migrations" / "002_menus_admin.sql"]
+        files = [
+            root / "schema.sql",
+            root / "migrations" / "002_menus_admin.sql",
+            root / "migrations" / "003_dialog_order.sql",
+        ]
         migrations = []
         for version, path in enumerate(files, 1):
             sql = await asyncio.to_thread(path.read_text, encoding="utf-8")
@@ -81,6 +120,9 @@ class Database:
 
     @staticmethod
     async def _user(conn, user_id: int, initial_spins: int):
+        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1 FOR UPDATE", user_id)
+        if user is not None:
+            return user
         await conn.execute(
             "INSERT INTO users(telegram_id,spins) VALUES ($1,$2) ON CONFLICT DO NOTHING",
             user_id,
@@ -89,12 +131,30 @@ class Database:
         return await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1 FOR UPDATE", user_id)
 
     async def profile(self, user_id: int, initial_spins: int):
-        async with self.pool.acquire() as conn, conn.transaction():
-            user = dict(await self._user(conn, user_id, initial_spins))
-            user["owned"] = await conn.fetchval("SELECT count(*) FROM user_cats WHERE user_id=$1", user_id)
-            user["total"] = await conn.fetchval("SELECT count(*) FROM cats WHERE active")
-            return user
+        cached = self._profiles.get(user_id)
+        if cached is not None:
+            return dict(cached)
+        generation = self._profile_generation
+        sql = """
+            SELECT u.*,(SELECT count(*) FROM user_cats WHERE user_id=u.telegram_id) AS owned,
+                       (SELECT count(*) FROM cats WHERE active) AS total
+            FROM users u WHERE u.telegram_id=$1
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, user_id)
+            if row is None:
+                await conn.execute(
+                    "INSERT INTO users(telegram_id,spins) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+                    user_id,
+                    initial_spins,
+                )
+                row = await conn.fetchrow(sql, user_id)
+        user = dict(row)
+        if generation == self._profile_generation:
+            self._profiles.put(user_id, user)
+        return dict(user)
 
+    @invalidates_profile(user_position=1)
     async def roll(self, update_id: int, user_id: int, initial_spins: int):
         async with self.pool.acquire() as conn, conn.transaction():
             user = await self._user(conn, user_id, initial_spins)
@@ -151,6 +211,7 @@ class Database:
         result = await self.daily_reward(user_id, today, initial_spins, bonus, max_spins, "fixed")
         return result["added"], result["balance"]
 
+    @invalidates_profile()
     async def daily_reward(self, user_id, today, initial_spins, bonus, max_spins, mode="streak"):
         async with self.pool.acquire() as conn, conn.transaction():
             user = await self._user(conn, user_id, initial_spins)
@@ -189,6 +250,7 @@ class Database:
             user_id,
         )
 
+    @invalidates_profile()
     async def set_nickname(self, user_id: int, nickname: str, initial_spins: int):
         async with self.pool.acquire() as conn, conn.transaction():
             await self._user(conn, user_id, initial_spins)
@@ -199,6 +261,7 @@ class Database:
             SELECT nickname,score FROM users WHERE score>0 ORDER BY score DESC,telegram_id LIMIT 10
         """)
 
+    @invalidates_profile(user_position=None)
     async def add_cat(self, cat_id, description, rarity, file_id, unique_id=None, source_path=None):
         cat_id, description, rarity = validate_cat(cat_id, description, rarity)
         if not file_id or file_id.startswith(("http:", "https:")):
@@ -259,25 +322,37 @@ class Database:
             "DELETE FROM update_receipts WHERE updated_at < now()-interval '7 days'"
         )
 
-    async def set_dialog(self, user_id: int, state: str):
+    async def set_dialog(self, user_id: int, state: str, *, update_id: int | None = None):
         await self.pool.execute(
             """
-            INSERT INTO dialog_states(user_id,state) VALUES ($1,$2)
-            ON CONFLICT (user_id) DO UPDATE SET state=$2,expires_at=now()+interval '30 minutes'
+            INSERT INTO dialog_states(user_id,state,update_id) VALUES ($1,$2,$3)
+            ON CONFLICT (user_id) DO UPDATE SET state=$2,update_id=$3,expires_at=now()+interval '30 minutes'
+            WHERE dialog_states.update_id<=$3 OR dialog_states.expires_at<=now()
         """,
             user_id,
             state,
+            current_update_id.get() if update_id is None else update_id,
         )
 
     async def dialog(self, user_id: int):
         return await self.pool.fetchval(
-            "SELECT state FROM dialog_states WHERE user_id=$1 AND expires_at>now()", user_id
+            "SELECT NULLIF(state,'') FROM dialog_states WHERE user_id=$1 AND expires_at>now()", user_id
         )
 
-    async def clear_dialog(self, user_id: int, state: str | None = None):
-        await self.pool.execute(
-            "DELETE FROM dialog_states WHERE user_id=$1 AND ($2::text IS NULL OR state=$2)", user_id, state
-        )
+    async def clear_dialog(self, user_id: int, state: str | None = None, *, update_id: int | None = None):
+        version = current_update_id.get() if update_id is None else update_id
+        if state is None:
+            await self.set_dialog(user_id, "", update_id=version)
+        else:
+            await self.pool.execute(
+                """
+                UPDATE dialog_states SET state='',update_id=$3,expires_at=now()+interval '30 minutes'
+                WHERE user_id=$1 AND state=$2 AND (update_id<=$3 OR expires_at<=now())
+            """,
+                user_id,
+                state,
+                version,
+            )
 
     async def enter_admin(self, user_id: int):
         await self.pool.execute(
@@ -325,6 +400,7 @@ class Database:
             "UPDATE promo_codes SET active=false WHERE code=$1 RETURNING code", code
         )
 
+    @invalidates_profile()
     async def redeem_promo(self, user_id: int, code: str, initial_spins: int, max_spins: int):
         async with self.pool.acquire() as conn, conn.transaction():
             user = await self._user(conn, user_id, initial_spins)
@@ -345,6 +421,7 @@ class Database:
             await conn.execute("UPDATE users SET spins=spins+$2 WHERE telegram_id=$1", user_id, added)
             return {"added": added, "balance": user["spins"] + added, "description": promo["description"]}
 
+    @invalidates_profile()
     async def claim_subscription(self, user_id: int, channel: str, initial: int, bonus: int, maximum: int):
         async with self.pool.acquire() as conn, conn.transaction():
             user = await self._user(conn, user_id, initial)
@@ -364,6 +441,7 @@ class Database:
             await conn.execute("UPDATE users SET spins=spins+$2 WHERE telegram_id=$1", user_id, added)
             return {"added": added, "balance": user["spins"] + added}
 
+    @invalidates_profile(user_position=None)
     async def set_cat_active(self, cat_id: str, active: bool):
         return await self.pool.fetchval("UPDATE cats SET active=$2 WHERE id=$1 RETURNING id", cat_id, active)
 

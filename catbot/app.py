@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hmac
 import logging
+import time
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -12,6 +13,7 @@ from pydantic import ValidationError
 from catbot.config import Settings
 from catbot.db import Database
 from catbot.handlers import create_router
+from catbot.runtime import TTLCache, current_update_id, is_navigation
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,9 @@ class Processor:
     def __init__(self, bot: Bot, dispatcher: Dispatcher, db: Database, settings: Settings):
         self.bot, self.dispatcher, self.db, self.settings = bot, dispatcher, db, settings
         self.slots = asyncio.Semaphore(settings.max_concurrent_updates)
+        self.navigation_done = TTLCache(ttl=300, capacity=4096)
+        self.navigation_running = set()
+        self.navigation_pending = {}
 
     async def process(self, update: Update):
         try:
@@ -31,8 +36,38 @@ class Processor:
         except TimeoutError as error:
             raise BusyUpdate from error
         claimed = False
+        navigation = is_navigation(update)
+        started = time.perf_counter()
+        context = current_update_id.set(update.update_id)
+        pending = None
+        user_id = None
         try:
             async with asyncio.timeout(45):
+                if navigation:
+                    # Redrawing a menu needs no durable economic-operation receipt.
+                    # Cross-restart retries are harmless; dialog versions preserve order.
+                    if self.navigation_done.get(update.update_id):
+                        return
+                    if update.update_id in self.navigation_running:
+                        raise BusyUpdate
+                    self.navigation_running.add(update.update_id)
+                    user_id = update.callback_query.from_user.id
+                    pending = asyncio.Event()
+                    self.navigation_pending.setdefault(user_id, set()).add(pending)
+                    try:
+                        await self.dispatcher.feed_update(
+                            self.bot, update, db=self.db, settings=self.settings
+                        )
+                        self.navigation_done.put(update.update_id, True)
+                    finally:
+                        self.navigation_running.discard(update.update_id)
+                    return
+                if update.message and update.message.from_user:
+                    # A player can type as soon as a prompt is painted, while its
+                    # state is still being persisted. Wait before consuming text.
+                    pending_states = tuple(self.navigation_pending.get(update.message.from_user.id, ()))
+                    if pending_states:
+                        await asyncio.gather(*(event.wait() for event in pending_states))
                 state = await self.db.claim_update(update.update_id)
                 if state == "done":
                     return
@@ -48,7 +83,20 @@ class Processor:
                     await asyncio.wait_for(self.db.release_update(update.update_id), timeout=5)
             raise
         finally:
+            if pending is not None:
+                pending.set()
+                events = self.navigation_pending.get(user_id)
+                if events is not None:
+                    events.discard(pending)
+                    if not events:
+                        self.navigation_pending.pop(user_id, None)
+            current_update_id.reset(context)
             self.slots.release()
+            logger.info(
+                "Update kind=%s elapsed_ms=%d",
+                "navigation" if navigation else "durable",
+                (time.perf_counter() - started) * 1000,
+            )
 
 
 def make_web_app(processor: Processor, settings: Settings) -> web.Application:

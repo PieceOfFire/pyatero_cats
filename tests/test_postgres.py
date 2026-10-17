@@ -134,3 +134,31 @@ async def test_admin_and_dialog_expiration(db):
     assert not await db.admin_active(123)
     await db.exit_admin(123)
     assert await db.dialog(123) is None
+
+
+async def test_late_navigation_clear_does_not_erase_newer_prompt(db):
+    await db.set_dialog(123, "nick", update_id=20)
+    await db.clear_dialog(123, update_id=10)
+    assert await db.dialog(123) == "nick"
+    await db.set_dialog(123, "promo", update_id=15)
+    assert await db.dialog(123) == "nick"
+    await db.clear_dialog(123, update_id=21)
+    await db.set_dialog(123, "nick", update_id=20)
+    assert await db.dialog(123) is None
+
+
+async def test_expired_dialog_accepts_randomized_update_sequence_after_long_idle(db):
+    await db.set_dialog(123, "nick", update_id=999999)
+    await db.pool.execute("UPDATE dialog_states SET expires_at=now()-interval '1 second'")
+    await db.set_dialog(123, "promo", update_id=1)
+    assert await db.dialog(123) == "promo"
+
+
+async def test_profile_cache_does_not_control_balance_and_invalidates_on_change(db):
+    await seed(db)
+    assert (await db.profile(123, 3))["spins"] == 3
+    await db.pool.execute("UPDATE users SET spins=0 WHERE telegram_id=123")
+    assert await db.roll(1, 123, 3) == {"error": "no_spins"}
+    assert (await db.profile(123, 3))["spins"] == 0
+    await db.set_nickname(123, "Новое имя", 3)
+    assert (await db.profile(123, 3))["nickname"] == "Новое имя"

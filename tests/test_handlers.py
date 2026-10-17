@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -7,6 +8,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, GetChatMember, SendMessage, SendPhoto
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
+from catbot.app import Processor
 from catbot.config import Settings
 from catbot.handlers import create_router
 
@@ -47,19 +49,19 @@ def message(text=None, caption=None, photo=None):
     )
 
 
-async def dispatch(msg, db, settings=None, session=None):
+async def dispatch(msg, db, settings=None, session=None, through_processor=False):
     session = session or MemoryTelegram()
     bot = Bot("123456789:abcdefghijklmnopqrstuvwxyz123456789", session=session)
     dp = Dispatcher()
     dp.include_router(create_router())
-    await dp.feed_update(
-        bot,
-        Update(
-            update_id=42, **({"callback_query": msg} if isinstance(msg, CallbackQuery) else {"message": msg})
-        ),
-        db=db,
-        settings=settings or Settings(bot.token, "postgresql://db/cats"),
+    update = Update(
+        update_id=42, **({"callback_query": msg} if isinstance(msg, CallbackQuery) else {"message": msg})
     )
+    settings = settings or Settings(bot.token, "postgresql://db/cats")
+    if through_processor:
+        await Processor(bot, dp, db, settings).process(update)
+    else:
+        await dp.feed_update(bot, update, db=db, settings=settings)
     await bot.session.close()
     return session.requests
 
@@ -266,3 +268,59 @@ async def test_subscribed_user_receives_reward_for_configured_channel():
     db.claim_subscription.return_value = {"added": 3, "balance": 6}
     await dispatch(callback("subscription_check"), db, settings)
     db.claim_subscription.assert_awaited_once_with(123, "@cats_band", 3, 3, 999)
+
+
+async def test_nickname_menu_is_visible_while_database_and_callback_answer_are_blocked():
+    db = fake_db()
+    release_database, release_answer, menu_visible = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def slow_clear(*args, **kwargs):
+        await release_database.wait()
+
+    class SlowTelegram(MemoryTelegram):
+        async def make_request(self, bot, method, timeout=None):  # noqa: ASYNC109
+            if isinstance(method, AnswerCallbackQuery):
+                await release_answer.wait()
+            if isinstance(method, EditMessageText):
+                menu_visible.set()
+            return await super().make_request(bot, method, timeout)
+
+    db.clear_dialog.side_effect = slow_clear
+    task = asyncio.create_task(
+        dispatch(callback("change_nick"), db, session=SlowTelegram(), through_processor=True)
+    )
+    try:
+        await asyncio.wait_for(menu_visible.wait(), timeout=1)
+        assert not task.done()
+        db.claim_update.assert_not_awaited()
+        db.finish_update.assert_not_awaited()
+    finally:
+        release_database.set()
+        release_answer.set()
+        await task
+
+
+async def test_manual_nickname_prompt_is_visible_before_state_storage_completes():
+    db = fake_db()
+    release, visible = asyncio.Event(), asyncio.Event()
+
+    async def slow_set(*args, **kwargs):
+        await release.wait()
+
+    class ObservedTelegram(MemoryTelegram):
+        async def make_request(self, bot, method, timeout=None):  # noqa: ASYNC109
+            if isinstance(method, EditMessageText):
+                visible.set()
+            return await super().make_request(bot, method, timeout)
+
+    db.set_dialog.side_effect = slow_set
+    task = asyncio.create_task(
+        dispatch(callback("nick_manual"), db, session=ObservedTelegram(), through_processor=True)
+    )
+    try:
+        await asyncio.wait_for(visible.wait(), timeout=1)
+        assert not task.done()
+        db.clear_dialog.assert_not_awaited()
+    finally:
+        release.set()
+        await task

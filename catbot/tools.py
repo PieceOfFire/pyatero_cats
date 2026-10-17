@@ -14,7 +14,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import BufferedInputFile
 from dotenv import load_dotenv
 
-from catbot.catalog import export_drafts, import_mail, publish_drafts, read_csv
+from catbot.catalog import export_drafts, import_local, import_mail, publish_drafts, read_csv
 from catbot.config import Settings
 from catbot.db import Database
 from catbot.domain import POINTS, validate_cat
@@ -209,11 +209,16 @@ async def run(args):
             await import_catalog(Path(args.csv), db, bot, settings)
         elif args.command == "import-users":
             await import_users(Path(args.csv), db, settings)
-        elif args.command == "import-mail":
-            inbox = args.inbox or os.getenv("MAIL_IMPORT_INBOX", "/pyatero-cats/inbox")
-            archive = args.archive or os.getenv("MAIL_IMPORT_ARCHIVE", "/pyatero-cats/imported")
-            async with MailStorage(os.getenv("MAIL_USER", ""), os.getenv("MAIL_APP_PASSWORD", "")) as mail:
-                result = await import_mail(mail, db, bot, settings, inbox, archive, args.csv, args.limit)
+        elif args.command in {"import-mail", "import-folder"}:
+            if args.command == "import-mail":
+                inbox = args.inbox or os.getenv("MAIL_IMPORT_INBOX", "/pyatero-cats/inbox")
+                archive = args.archive or os.getenv("MAIL_IMPORT_ARCHIVE", "/pyatero-cats/imported")
+                async with MailStorage(
+                    os.getenv("MAIL_USER", ""), os.getenv("MAIL_APP_PASSWORD", "")
+                ) as mail:
+                    result = await import_mail(mail, db, bot, settings, inbox, archive, args.csv, args.limit)
+            else:
+                result = await import_local(db, bot, settings, args.inbox, args.archive, args.csv, args.limit)
             print(
                 f"Новых: {result['imported']}; повторных: {result['reused']}; "
                 f"перенесено: {result['moved']}; пропущено не-фото: {result['ignored']}; "
@@ -244,6 +249,11 @@ def main():
     sub = subs.add_parser("import-mail", help="Фото из папки Mail → черновики в базе + CSV для подписей")
     sub.add_argument("--inbox", help="Папка Mail с новыми фото; по умолчанию MAIL_IMPORT_INBOX")
     sub.add_argument("--archive", help="Куда переносить фото; по умолчанию MAIL_IMPORT_ARCHIVE")
+    sub.add_argument("--csv", default="data/private/mail-drafts.csv")
+    sub.add_argument("--limit", type=int, default=100)
+    sub = subs.add_parser("import-folder", help="Локальная папка → черновики + CSV; пароль Mail не нужен")
+    sub.add_argument("--inbox", default="data/private/inbox")
+    sub.add_argument("--archive", default="data/private/imported")
     sub.add_argument("--csv", default="data/private/mail-drafts.csv")
     sub.add_argument("--limit", type=int, default=100)
     for name in ("export-drafts", "publish-drafts"):

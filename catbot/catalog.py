@@ -1,4 +1,4 @@
-"""Batch import from Mail into unpublished cards, then review and publish a CSV."""
+"""Batch import into unpublished cards, then review and publish a CSV."""
 
 import asyncio
 import csv
@@ -11,9 +11,10 @@ from pathlib import Path, PurePosixPath
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import BufferedInputFile
 
+from catbot.local_storage import LocalStorage
 from catbot.mail_storage import MAX_PHOTO_BYTES, mail_path
 
-REVIEW_FIELDS = ["id", "description", "rarity", "mail_path"]
+REVIEW_FIELDS = ["id", "description", "rarity", "source_path"]
 PHOTO_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
@@ -67,7 +68,7 @@ async def export_drafts(path, db):
                 "id": card["id"],
                 "description": previous.get("description") or card["description"],
                 "rarity": previous.get("rarity", ""),
-                "mail_path": card["source_path"] or "",
+                "source_path": card["source_path"] or "",
             }
         )
     await asyncio.to_thread(write_review_csv, path, rows)
@@ -104,15 +105,26 @@ async def import_mail(mail, db, bot, settings, inbox, archive, csv_path, limit=1
     inbox, archive = mail_path(inbox), mail_path(archive)
     if inbox == "/" or archive == "/" or inbox == archive:
         raise ValueError("Укажи разные непустые папки входящих и архива внутри Облака Mail")
+    return await import_photos(mail, db, bot, settings, inbox, archive, csv_path, limit)
+
+
+async def import_local(db, bot, settings, inbox, archive, csv_path, limit=100):
+    storage = await asyncio.to_thread(LocalStorage, inbox, archive)
+    return await import_photos(
+        storage, db, bot, settings, storage.inbox.as_posix(), storage.archive.as_posix(), csv_path, limit
+    )
+
+
+async def import_photos(storage, db, bot, settings, inbox, archive, csv_path, limit=100):
     if settings.media_chat_id is None:
         raise ValueError("Для пакетной загрузки фото заполни MEDIA_CHAT_ID")
     if not 1 <= limit <= 10000:
         raise ValueError("Лимит импорта: от 1 до 10000 файлов")
     # Fail before uploading if the existing review CSV is malformed or unwritable.
     await export_drafts(csv_path, db)
-    await mail.mkdirs(inbox)
-    await mail.mkdirs(archive)
-    files = await mail.list_files(inbox)
+    await storage.mkdirs(inbox)
+    await storage.mkdirs(archive)
+    files = await storage.list_files(inbox)
     photos = [f for f in files if PurePosixPath(f["path"]).suffix.lower() in PHOTO_SUFFIXES]
     stats = {"imported": 0, "reused": 0, "moved": 0, "errors": 0, "ignored": len(files) - len(photos)}
     try:
@@ -122,7 +134,7 @@ async def import_mail(mail, db, bot, settings, inbox, archive, csv_path, limit=1
             try:
                 if entry["size"] is not None and entry["size"] > MAX_PHOTO_BYTES:
                     raise ValueError("Фото превышает 10 МБ")
-                data = await mail.download_photo(entry["path"])
+                data = await storage.download_photo(entry["path"])
                 sha256 = (await asyncio.to_thread(hashlib.sha256, data)).hexdigest()
                 filename = PurePosixPath(name)
                 target = archive + "/" + sha256 + "_" + filename.stem[:80] + filename.suffix.lower()
@@ -138,7 +150,7 @@ async def import_mail(mail, db, bot, settings, inbox, archive, csv_path, limit=1
                 # The DB already holds the file_id. A failed MOVE is safe to retry:
                 # the next scan finds the same hash and skips the Telegram upload.
                 phase = "перенос в архив"
-                await mail.move_file(entry["path"], target)
+                await storage.move_file(entry["path"], target)
                 stats["moved"] += 1
                 print(f"Сохранено: #{card['id']} · {name}")
             except Exception as error:

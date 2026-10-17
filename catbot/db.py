@@ -130,6 +130,9 @@ class Database:
                     )
                 elif previous != checksum:
                     raise RuntimeError(f"Миграция {version} изменена после применения: нужна новая миграция")
+        # DDL uses a separate direct connection. Recycle pooled connections so
+        # prepared SELECT * statements cannot retain the previous row shape.
+        await self.pool.expire_connections()
 
     async def bind_bot(self, bot_id: int):
         async with self.pool.acquire() as conn, conn.transaction():

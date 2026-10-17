@@ -265,3 +265,13 @@ async def test_retry_publication_does_not_reenable_a_hidden_card(db):
     await db.set_cat_active(card["id"], False)
     assert await db.publish_cat_drafts(ready) == 0
     assert not await db.pool.fetchval("SELECT active FROM cats WHERE id=$1", card["id"])
+
+
+async def test_migration_refreshes_prepared_queries_after_schema_change(db):
+    await seed(db)
+    await db.pool.fetchrow("SELECT * FROM cats WHERE id=$1", "c0")
+    async with db._migration_connection() as conn:
+        await conn.execute("ALTER TABLE cats ADD COLUMN test_metadata text")
+    await db.migrate()
+    row = await db.pool.fetchrow("SELECT * FROM cats WHERE id=$1", "c0")
+    assert row["id"] == "c0" and "test_metadata" in row

@@ -55,12 +55,9 @@ def create_router() -> Router:
     router.message.filter(F.chat.type == ChatType.PRIVATE)
     router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
 
-    async def require_admin(message, user_id, db, settings):
+    async def require_admin(message, user_id, settings):
         if not settings.is_admin(user_id):
             await message.answer("⛔ Эта функция доступна только администратору.")
-            return False
-        if not await db.admin_active(user_id):
-            await message.answer("🔐 Сначала включи админский режим: /admin")
             return False
         return True
 
@@ -73,8 +70,7 @@ def create_router() -> Router:
         )
         if note:
             text += f"\n\n{note}"
-        # The entry button depends only on the allowlist. Privileged actions still
-        # check the durable admin session; drawing a menu needs no session query.
+        # Menu visibility and every privileged action use the configured allowlist.
         await render(message, text, menu(settings, user_id), edit)
 
     async def profile(message, user_id, db, settings, edit=False):
@@ -94,7 +90,7 @@ def create_router() -> Router:
         )
 
     @router.message(CommandStart())
-    @router.message(Command("menu", "cancel"))
+    @router.message(Command("menu", "cancel", "adminoff"))
     async def start(message: Message, db: Database, settings: Settings):
         await db.clear_dialog(message.from_user.id)
         await main_menu(message, message.from_user.id, db, settings)
@@ -113,7 +109,7 @@ def create_router() -> Router:
         )
         if settings.is_admin(message.from_user.id):
             text += (
-                "\n\n/admin — вход в админский режим\n/adminoff — выход\n"
+                "\n\n/admin — админское меню\n"
                 "/addcat ID | RARITY | описание — подпись к фото\n"
                 "/promocreate КОД | спины | описание — новый промокод"
             )
@@ -244,27 +240,18 @@ def create_router() -> Router:
     async def top_command(message: Message, db: Database):
         await top(message, db)
 
-    async def enter_admin(message, user_id, db, settings, edit=False):
-        if not settings.is_admin(user_id):
-            await render(message, "⛔ Админский режим недоступен для твоего Telegram ID.", kb.back(), edit)
+    async def open_admin(message, user_id, db, settings, edit=False):
+        if not await require_admin(message, user_id, settings):
             return
-        await db.enter_admin(user_id)
         await db.clear_dialog(user_id)
-        await render(
-            message, "⚙️ Админский режим включён на 12 часов.\nВыбери действие:", kb.admin_panel(), edit
-        )
+        await render(message, "⚙️ Админ-панель\nВыбери действие:", kb.admin_panel(), edit)
 
     @router.message(Command("admin"))
     async def admin_command(message: Message, db: Database, settings: Settings):
-        await enter_admin(message, message.from_user.id, db, settings)
-
-    @router.message(Command("adminoff"))
-    async def admin_off(message: Message, db: Database, settings: Settings):
-        await db.exit_admin(message.from_user.id)
-        await main_menu(message, message.from_user.id, db, settings, note="Админский режим выключен.")
+        await open_admin(message, message.from_user.id, db, settings)
 
     async def register_cat(message, user_id, raw, db, settings):
-        if not await require_admin(message, user_id, db, settings):
+        if not await require_admin(message, user_id, settings):
             return
         photo_message = message if message.photo else message.reply_to_message
         if not photo_message or not photo_message.photo:
@@ -292,7 +279,7 @@ def create_router() -> Router:
         await register_cat(message, message.from_user.id, command.args or "", db, settings)
 
     async def create_promo(message, user_id, raw, db, settings):
-        if not await require_admin(message, user_id, db, settings):
+        if not await require_admin(message, user_id, settings):
             return
         try:
             code, bonus, description = parse_promo(raw, settings.max_spins)
@@ -421,8 +408,8 @@ def create_router() -> Router:
             await navigate(query, event_update, db, settings)
             return
         # Verify privileges on every sensitive callback, even if the button was forged.
-        if data.startswith("admin_") and data not in {"admin_open", "admin_exit"}:
-            if not await require_admin(msg, user_id, db, settings):
+        if data.startswith("admin_"):
+            if not await require_admin(msg, user_id, settings):
                 try:
                     await query.answer("Нет доступа", show_alert=True)
                 except TelegramBadRequest:
@@ -446,10 +433,10 @@ def create_router() -> Router:
         elif data == "subscription_check":
             await check_subscription(query, bot, db, settings)
         elif data == "admin_open":
-            await enter_admin(msg, user_id, db, settings, True)
+            await open_admin(msg, user_id, db, settings, True)
         elif data == "admin_exit":
-            await db.exit_admin(user_id)
-            await main_menu(msg, user_id, db, settings, True, "Админский режим выключен.")
+            # Compatibility with buttons on menus sent before sessions were removed.
+            await main_menu(msg, user_id, db, settings, True)
         elif data in {
             "admin_addcat",
             "admin_hidecat",
@@ -527,7 +514,7 @@ def create_router() -> Router:
         if not state:
             await main_menu(message, user_id, db, settings, note="Выбери действие кнопками ниже.")
             return
-        if state.startswith("admin_") and not await require_admin(message, user_id, db, settings):
+        if state.startswith("admin_") and not await require_admin(message, user_id, settings):
             return
         if state == "nick":
             await save_nick(message, user_id, raw, db, settings)

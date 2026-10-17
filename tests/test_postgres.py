@@ -126,14 +126,10 @@ async def test_streak_and_daily_are_atomic(db):
     assert (await db.profile(10, 3))["streak"] == 1
 
 
-async def test_admin_and_dialog_expiration(db):
-    await db.enter_admin(123)
+async def test_dialog_expiration(db):
     await db.set_dialog(123, "admin_addcat")
-    assert await db.admin_active(123)
     assert await db.dialog(123) == "admin_addcat"
-    await db.pool.execute("UPDATE admin_sessions SET expires_at=now()-interval '1 second'")
-    assert not await db.admin_active(123)
-    await db.exit_admin(123)
+    await db.pool.execute("UPDATE dialog_states SET expires_at=now()-interval '1 second'")
     assert await db.dialog(123) is None
 
 

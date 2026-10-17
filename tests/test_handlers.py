@@ -77,7 +77,6 @@ def fake_db():
         "total": 10,
     }
     db.dialog.return_value = None
-    db.admin_active.return_value = False
     return db
 
 
@@ -128,7 +127,6 @@ async def test_non_admin_cannot_add_card():
 
 async def test_admin_photo_caption_registers_card():
     db = fake_db()
-    db.admin_active.return_value = True
     settings = Settings("token", "postgresql://db/cats", admin_ids=frozenset({123}))
     await dispatch(
         message(
@@ -191,14 +189,11 @@ async def test_profile_shows_telegram_identity_separately_from_nickname():
     assert "Тестовый кот" in text and "@cat_owner" in text and "ID: 123" in text
 
 
-async def test_admin_directory_requires_allowlist_and_active_session():
+async def test_admin_directory_requires_only_allowlist():
     db = fake_db()
     await dispatch(callback("admin_users:0"), db)
     db.admin_users.assert_not_awaited()
     settings = Settings("token", "postgresql://db/cats", admin_ids=frozenset({123}))
-    await dispatch(callback("admin_users:0"), db, settings)
-    db.admin_users.assert_not_awaited()
-    db.admin_active.return_value = True
     db.admin_users.return_value = (
         [
             {
@@ -216,27 +211,44 @@ async def test_admin_directory_requires_allowlist_and_active_session():
     db.admin_users.assert_awaited_once_with(0)
 
 
-async def test_ordinary_user_cannot_enter_admin_mode():
+async def test_ordinary_user_cannot_open_admin_menu():
     db = fake_db()
-    await dispatch(message(text="/admin"), db)
+    requests = await dispatch(message(text="/admin"), db)
+    assert any("только администратору" in (getattr(r, "text", "") or "") for r in requests)
+    db.clear_dialog.assert_not_awaited()
     db.enter_admin.assert_not_awaited()
 
 
-async def test_allowlisted_admin_must_enable_mode_before_changes():
+async def test_allowlisted_admin_can_use_saved_buttons_without_opening_menu():
     db = fake_db()
     settings = Settings("token", "postgresql://db/cats", admin_ids=frozenset({123}))
-    requests = await dispatch(message(text="/addcat c1 | COM | Кот"), db, settings)
-    assert any("Сначала включи" in (getattr(r, "text", "") or "") for r in requests)
-    db.add_cat.assert_not_awaited()
+    await dispatch(callback("admin_hidecat"), db, settings)
+    db.set_dialog.assert_awaited_once_with(123, "admin_hidecat")
+    db.admin_active.assert_not_awaited()
 
 
-async def test_admin_entry_and_exit():
+async def test_admin_command_opens_menu_without_starting_session():
     db = fake_db()
     settings = Settings("token", "postgresql://db/cats", admin_ids=frozenset({123}))
-    await dispatch(message(text="/admin"), db, settings)
-    db.enter_admin.assert_awaited_once_with(123)
+    for _ in range(2):
+        requests = await dispatch(message(text="/admin"), db, settings)
+        sent = next(r for r in requests if isinstance(r, SendMessage))
+        assert "Админ-панель" in sent.text and "12 часов" not in sent.text
+        buttons = [b.callback_data for row in sent.reply_markup.inline_keyboard for b in row]
+        assert "admin_users:0" in buttons and "admin_exit" not in buttons
+    db.enter_admin.assert_not_awaited()
+    db.admin_active.assert_not_awaited()
+
+
+async def test_legacy_adminoff_returns_to_menu_without_revoking_admin_access():
+    db = fake_db()
+    settings = Settings("token", "postgresql://db/cats", admin_ids=frozenset({123}))
     await dispatch(message(text="/adminoff"), db, settings)
-    db.exit_admin.assert_awaited_once_with(123)
+    db.clear_dialog.assert_awaited_once_with(123)
+    db.exit_admin.assert_not_awaited()
+    db.stats.return_value = {"users": 1, "cats": 1, "rolls": 1, "redemptions": 0}
+    await dispatch(callback("admin_stats"), db, settings)
+    db.stats.assert_awaited_once()
 
 
 async def test_forged_admin_callback_does_not_read_stats():
@@ -253,12 +265,11 @@ async def test_forged_admin_dialog_rechecks_allowlist():
     db.set_cat_active.assert_not_awaited()
 
 
-async def test_promo_creation_requires_active_admin():
+async def test_promo_creation_requires_only_allowlist():
     db = fake_db()
-    settings = Settings("token", "postgresql://db/cats", admin_ids=frozenset({123}))
-    await dispatch(message(text="/promocreate cats | 5 | Привет"), db, settings)
+    await dispatch(message(text="/promocreate cats | 5 | Привет"), db)
     db.create_promo.assert_not_awaited()
-    db.admin_active.return_value = True
+    settings = Settings("token", "postgresql://db/cats", admin_ids=frozenset({123}))
     await dispatch(message(text="/promocreate cats | 5 | Привет"), db, settings)
     db.create_promo.assert_awaited_once_with("CATS", 5, "Привет", 123)
 

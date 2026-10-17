@@ -11,7 +11,7 @@ def back(data="back_main", text="⬅️ Назад"):
     return InlineKeyboardMarkup(inline_keyboard=[[button(text, data)]])
 
 
-def menu(settings: Settings, user_id: int | None = None, admin_mode: bool = False):
+def menu(settings: Settings, user_id: int | None = None):
     rows = [
         [button("🎰 Спин", "spin")],
         [button("🎁 Награды", "rewards")],
@@ -22,7 +22,7 @@ def menu(settings: Settings, user_id: int | None = None, admin_mode: bool = Fals
     if settings.band_url:
         rows.append([InlineKeyboardButton(text="🎵 Пятеро котят", url=settings.band_url)])
     if user_id is not None and settings.is_admin(user_id):
-        rows.append([button("⚙️ Админ-панель" if admin_mode else "🔐 Админский режим", "admin_open")])
+        rows.append([button("⚙️ Админ-панель", "admin_open")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -54,7 +54,6 @@ def admin_panel():
             [button("📊 Статистика", "admin_stats")],
             [button("👥 Пользователи", "admin_users:0")],
             [button("🏠 Главное меню", "back_main")],
-            [button("🔓 Выйти из админского режима", "admin_exit")],
         ]
     )
 

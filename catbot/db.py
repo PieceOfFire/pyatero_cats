@@ -425,27 +425,6 @@ class Database:
                 version,
             )
 
-    async def enter_admin(self, user_id: int):
-        await self.pool.execute(
-            """
-            INSERT INTO admin_sessions(user_id) VALUES ($1)
-            ON CONFLICT (user_id) DO UPDATE SET expires_at=now()+interval '12 hours'
-        """,
-            user_id,
-        )
-
-    async def admin_active(self, user_id: int) -> bool:
-        return bool(
-            await self.pool.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM admin_sessions WHERE user_id=$1 AND expires_at>now())", user_id
-            )
-        )
-
-    async def exit_admin(self, user_id: int):
-        async with self.pool.acquire() as conn, conn.transaction():
-            await conn.execute("DELETE FROM admin_sessions WHERE user_id=$1", user_id)
-            await conn.execute("DELETE FROM dialog_states WHERE user_id=$1", user_id)
-
     async def create_promo(self, code: str, bonus: int, description: str, admin_id: int):
         # An existing code cannot be silently changed/re-enabled by a repeated request.
         return await self.pool.fetchval(
